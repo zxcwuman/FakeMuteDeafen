@@ -26,3 +26,12 @@ pnpm inject
 Настройки Discord → раздел Vencord (в самом низу) → Plugins → включить FakeMuteDeafenLab.
 Зайти в голосовой канал.
 В чате набрать /fakemute — Discord покажет тебя заглушённым, но микрофон работает. /fakedeafen — то же с «оглох». Повторный ввод команды выключает режим. Там же, в настройках плагина, есть кнопки и статус всех состояний.
+
+
+
+ОЧЕНЬ ВАЖНОЕ ПРЕМЕЧАНИЕ ПОСЛЕ
+mkdir src\userplugins\fakeMuteDeafen
+copy путь\к\fakeMuteDeafen_index.tsx src\userplugins\fakeMuteDeafen\index.tsx
+Берём код из файла код и вставляем туда 
+Нажимает ctrl+c 
+и закрываем файл
