@@ -1,1 +1,741 @@
+/*
+ * Vencord / Equicord a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+import { definePluginSettings } from "@api/Settings";
+import { ApplicationCommandInputType } from "@api/Commands";
+import { Logger } from "@utils/Logger";
+import { sleep } from "@utils/misc";
+import definePlugin, { OptionType } from "@utils/types";
+import type { MediaEngineConnection } from "@vencord/discord-types";
+import { findAll, findByPropsLazy } from "@webpack";
+import { Button, Forms, MediaEngineStore, React, UserStore, VoiceStateStore } from "@webpack/common";
+
+const VoiceActions = findByPropsLazy("toggleSelfMute", "toggleSelfDeaf");
+
+const logger = new Logger("FakeMuteDeafenLab");
+
+const settings = definePluginSettings({
+    fakeMute: {
+        type: OptionType.BOOLEAN,
+        description: "Keep local microphone input active while Discord shows you as muted.",
+        default: false,
+        onChange(value: boolean) {
+            if (suppressFakeSettingOnChange) return;
+            void setFakeMute(value, "settings");
+        }
+    },
+    fakeDeafen: {
+        type: OptionType.BOOLEAN,
+        description: "Keep local microphone input and voice output active while Discord shows you as deafened.",
+        default: false,
+        onChange(value: boolean) {
+            if (suppressFakeSettingOnChange) return;
+            void setFakeDeafen(value, "settings");
+        }
+    },
+    autoRestoreLocalMedia: {
+        type: OptionType.BOOLEAN,
+        description: "Periodically re-apply the visible fake state and local media restoration.",
+        default: true
+    },
+    restoreDelayMs: {
+        type: OptionType.NUMBER,
+        description: "Delay before restoring local media after Discord changes the visible voice state.",
+        default: 450
+    },
+    debugLogs: {
+        type: OptionType.BOOLEAN,
+        description: "Log concise state changes to DevTools.",
+        default: true
+    }
+});
+
+type UnknownRecord = Record<string, any>;
+type VoiceTarget = { selfMute: boolean; selfDeaf: boolean; };
+
+let rtcConnectionClass: any | undefined;
+let lastRtcConnectionInstance: any | undefined;
+let originalRtcConnect: ((...args: any[]) => any) | undefined;
+let originalRtcSetState: ((...args: any[]) => any) | undefined;
+let restoreTimer: ReturnType<typeof setInterval> | undefined;
+let applyTimer: ReturnType<typeof setTimeout> | undefined;
+let restoreBurstTimers: number[] = [];
+let ensureGeneration = 0;
+let suppressFakeSettingOnChange = false;
+let internalVoiceActionDepth = 0;
+let visibleSyncRunning = false;
+let pendingVisibleTarget: VoiceTarget | undefined;
+let pendingVisibleUntil = 0;
+let pendingVisibleTimer: number | undefined;
+let postFakeIntent: VoiceTarget = { selfMute: false, selfDeaf: false };
+let fakeSessionActive = false;
+
+function log(event: string, payload: UnknownRecord = {}) {
+    if (!settings.store.debugLogs) return;
+    console.info("[FakeMuteDeafenLab]", event, payload);
+    logger.debug(event, payload);
+}
+
+function currentVoiceState() {
+    const userId = UserStore.getCurrentUser?.()?.id;
+    return userId ? VoiceStateStore.getVoiceStateForUser?.(userId) : undefined;
+}
+
+function currentRemoteState() {
+    const state = currentVoiceState();
+    return {
+        selfMute: Boolean(state?.selfMute),
+        selfDeaf: Boolean(state?.selfDeaf),
+        channelId: state?.channelId,
+        sessionIdPresent: Boolean(state?.sessionId)
+    };
+}
+
+function sameVoiceTarget(left: VoiceTarget | undefined, right: VoiceTarget | undefined) {
+    return left?.selfMute === right?.selfMute && left?.selfDeaf === right?.selfDeaf;
+}
+
+function visibleVoiceTarget(): VoiceTarget {
+    const { fakeDeafen, fakeMute } = settings.store;
+    if (!fakeMute && !fakeDeafen) return { ...postFakeIntent };
+
+    return {
+        selfMute: fakeMute || fakeDeafen,
+        selfDeaf: fakeDeafen
+    };
+}
+
+function clearPendingVisibleTarget(target?: VoiceTarget) {
+    if (target && !sameVoiceTarget(pendingVisibleTarget, target)) return;
+    if (pendingVisibleTimer) window.clearTimeout(pendingVisibleTimer);
+    pendingVisibleTimer = undefined;
+    pendingVisibleTarget = undefined;
+    pendingVisibleUntil = 0;
+}
+
+function setPendingVisibleTarget(target: VoiceTarget) {
+    clearPendingVisibleTarget();
+    pendingVisibleTarget = target;
+    pendingVisibleUntil = Date.now() + 3500;
+    pendingVisibleTimer = window.setTimeout(() => {
+        log("visible_target_expired", { target: pendingVisibleTarget, visible: currentRemoteState() });
+        clearPendingVisibleTarget();
+    }, 3500);
+}
+
+function confirmPendingVisibleTarget() {
+    const visible = currentRemoteState();
+    if (sameVoiceTarget(pendingVisibleTarget, visible)) clearPendingVisibleTarget();
+}
+
+async function runInternalVoiceAction(action: () => unknown) {
+    internalVoiceActionDepth++;
+    try {
+        await action();
+    } finally {
+        internalVoiceActionDepth--;
+    }
+}
+
+async function waitForVisibleProperty(property: keyof VoiceTarget, value: boolean, target: VoiceTarget) {
+    const deadline = Date.now() + 1800;
+    while (Date.now() < deadline) {
+        if (!sameVoiceTarget(pendingVisibleTarget, target)) return false;
+        if (currentRemoteState()[property] === value) return true;
+        await sleep(50);
+    }
+
+    return currentRemoteState()[property] === value;
+}
+
+async function applyVisibleTarget(target: VoiceTarget) {
+    let visible = currentRemoteState();
+
+    if (visible.selfDeaf !== target.selfDeaf) {
+        await runInternalVoiceAction(() => VoiceActions.toggleSelfDeaf());
+        await waitForVisibleProperty("selfDeaf", target.selfDeaf, target);
+    }
+
+    if (!sameVoiceTarget(pendingVisibleTarget, target)) return;
+    visible = currentRemoteState();
+
+    if (visible.selfMute !== target.selfMute) {
+        await runInternalVoiceAction(() => VoiceActions.toggleSelfMute());
+        await waitForVisibleProperty("selfMute", target.selfMute, target);
+    }
+}
+
+async function syncVisibleState(reason: string) {
+    const target = visibleVoiceTarget();
+    const visible = currentRemoteState();
+    if (!visible.channelId) {
+        clearPendingVisibleTarget();
+        return;
+    }
+
+    if (sameVoiceTarget(target, visible)) {
+        if (visibleSyncRunning) {
+            if (!sameVoiceTarget(pendingVisibleTarget, target)) setPendingVisibleTarget(target);
+        } else {
+            clearPendingVisibleTarget();
+        }
+        return;
+    }
+
+    const samePendingTarget = sameVoiceTarget(pendingVisibleTarget, target) && Date.now() < pendingVisibleUntil;
+    if (!samePendingTarget) setPendingVisibleTarget(target);
+    if (visibleSyncRunning || samePendingTarget) return;
+
+    visibleSyncRunning = true;
+    try {
+        while (pendingVisibleTarget) {
+            const activeTarget = pendingVisibleTarget;
+            log("sync_visible_state", { reason, target: activeTarget, visible: currentRemoteState() });
+            try {
+                await applyVisibleTarget(activeTarget);
+            } catch (error) {
+                log("sync_visible_state_failed", { reason, target: activeTarget, error: String(error) });
+                break;
+            }
+
+            if (sameVoiceTarget(activeTarget, currentRemoteState())) {
+                clearPendingVisibleTarget(activeTarget);
+                continue;
+            }
+
+            if (sameVoiceTarget(pendingVisibleTarget, activeTarget)) break;
+        }
+    } finally {
+        visibleSyncRunning = false;
+    }
+}
+
+function rememberNativeMuteIntent(mute?: boolean) {
+    if (!fakeStateActive() || internalVoiceActionDepth) return;
+
+    const selfMute = mute ?? !currentRemoteState().selfMute;
+    postFakeIntent = {
+        selfMute,
+        selfDeaf: selfMute ? postFakeIntent.selfDeaf : false
+    };
+    log("remember_native_mute_intent", { postFakeIntent });
+}
+
+function rememberNativeDeafIntent() {
+    if (!fakeStateActive() || internalVoiceActionDepth) return;
+
+    const selfDeaf = !currentRemoteState().selfDeaf;
+    postFakeIntent = {
+        selfMute: selfDeaf,
+        selfDeaf
+    };
+    log("remember_native_deaf_intent", { postFakeIntent });
+}
+
+function getRtcConnectionClass() {
+    if (rtcConnectionClass) return rtcConnectionClass;
+
+    const [mod] = findAll((m: any) => {
+        try {
+            const candidate = typeof m === "function"
+                ? m
+                : typeof m?.A === "function"
+                    ? m.A
+                    : undefined;
+            if (!candidate?.prototype) return false;
+
+            const src = Function.prototype.toString.call(candidate);
+            return src.includes("RTCConnection._handleConnect")
+                && src.includes("_handleDisconnect")
+                && src.includes("selectProtocol")
+                && typeof candidate.prototype.setState === "function";
+        } catch {
+            return false;
+        }
+    });
+
+    rtcConnectionClass = typeof mod === "function" ? mod : mod?.A;
+    return rtcConnectionClass;
+}
+
+function installRtcTracker() {
+    const cls = getRtcConnectionClass();
+    const proto = cls?.prototype;
+    if (!proto) {
+        log("rtc_tracker_failed", { reason: "RTCConnection class not found" });
+        return;
+    }
+
+    if (!originalRtcConnect && typeof proto.connect === "function") {
+        originalRtcConnect = proto.connect;
+        proto.connect = function (...args: any[]) {
+            lastRtcConnectionInstance = this;
+            return originalRtcConnect!.apply(this, args);
+        };
+    }
+
+    if (!originalRtcSetState && typeof proto.setState === "function") {
+        originalRtcSetState = proto.setState;
+        proto.setState = function (...args: any[]) {
+            lastRtcConnectionInstance = this;
+            return originalRtcSetState!.apply(this, args);
+        };
+    }
+
+    log("rtc_tracker_installed", { hasConnect: Boolean(originalRtcConnect), hasSetState: Boolean(originalRtcSetState) });
+}
+
+function uninstallRtcTracker() {
+    const cls = getRtcConnectionClass();
+    const proto = cls?.prototype;
+    if (proto && originalRtcConnect) proto.connect = originalRtcConnect;
+    if (proto && originalRtcSetState) proto.setState = originalRtcSetState;
+    originalRtcConnect = undefined;
+    originalRtcSetState = undefined;
+}
+
+function fakeStateActive() {
+    return Boolean(settings.store.fakeMute || settings.store.fakeDeafen);
+}
+
+function updateFakeMuteSetting(enabled: boolean) {
+    if (settings.store.fakeMute === enabled) return;
+    suppressFakeSettingOnChange = true;
+    try {
+        settings.store.fakeMute = enabled;
+    } finally {
+        suppressFakeSettingOnChange = false;
+    }
+}
+
+function updateFakeDeafenSetting(enabled: boolean) {
+    if (settings.store.fakeDeafen === enabled) return;
+    suppressFakeSettingOnChange = true;
+    try {
+        settings.store.fakeDeafen = enabled;
+    } finally {
+        suppressFakeSettingOnChange = false;
+    }
+}
+
+function cancelPendingApplyTimer() {
+    if (applyTimer) clearTimeout(applyTimer);
+    applyTimer = undefined;
+}
+
+function cancelPendingFakeWork() {
+    cancelPendingApplyTimer();
+    clearRestoreBurst();
+    ensureGeneration++;
+}
+
+function getMediaConnection(): MediaEngineConnection | undefined {
+    return lastRtcConnectionInstance?._connection;
+}
+
+function getMediaConnections() {
+    const connections = new Set<MediaEngineConnection>();
+    const trackedConnection = getMediaConnection();
+    if (trackedConnection && trackedConnection.context !== "stream") connections.add(trackedConnection);
+
+    for (const connection of MediaEngineStore.getMediaEngine().connections) {
+        if (connection.context === "default") connections.add(connection);
+    }
+
+    return [...connections];
+}
+
+function inspectMediaConnection() {
+    const connections = getMediaConnections();
+    const connection = getMediaConnection() ?? connections[0];
+    if (!connection) return {
+        present: false,
+        connectionCount: connections.length,
+        localTarget: localMediaTarget(),
+        pendingVisibleTarget,
+        postFakeIntent,
+        visibleTarget: visibleVoiceTarget(),
+        visible: currentRemoteState()
+    };
+
+    return {
+        present: true,
+        connectionCount: connections.length,
+        constructor: connection.constructor?.name,
+        selfMute: connection.getSelfMute?.(),
+        selfDeaf: connection.getSelfDeaf?.(),
+        rtcState: lastRtcConnectionInstance?.state,
+        localTarget: localMediaTarget(),
+        pendingVisibleTarget,
+        postFakeIntent,
+        visibleTarget: visibleVoiceTarget(),
+        visible: currentRemoteState()
+    };
+}
+
+function callFirstAvailable(connection: any, candidates: string[], value: boolean, invertFor?: string) {
+    const attempts: UnknownRecord[] = [];
+
+    for (const name of candidates) {
+        if (typeof connection?.[name] !== "function") continue;
+
+        try {
+            connection[name](name === invertFor ? !value : value);
+            attempts.push({ name, ok: true });
+        } catch (err) {
+            attempts.push({ name, ok: false, error: String(err) });
+        }
+    }
+
+    return attempts;
+}
+
+function syncRemotePlayback(connection: MediaEngineConnection) {
+    const { channelId } = currentRemoteState();
+    if (!channelId) return [];
+
+    const currentUserId = UserStore.getCurrentUser()?.id;
+    const attempts: UnknownRecord[] = [];
+
+    for (const userId of Object.keys(VoiceStateStore.getVoiceStatesForChannel(channelId))) {
+        if (userId === currentUserId) continue;
+
+        const muted = MediaEngineStore.isLocalMute(userId);
+        try {
+            connection.setLocalMute(userId, muted);
+            attempts.push({ userId, muted, ok: true });
+        } catch (err) {
+            attempts.push({ userId, muted, ok: false, error: String(err) });
+        }
+    }
+
+    return attempts;
+}
+
+function forceLocalMedia(options: { muted?: boolean; deafened?: boolean; } = {}) {
+    const connections = getMediaConnections();
+    if (!connections.length) {
+        log("force_local_media_failed", { reason: "RTC media connection unavailable", remote: currentRemoteState() });
+        return false;
+    }
+
+    const attempts: UnknownRecord[] = [];
+    let restored = false;
+
+    for (const connection of connections) {
+        const connectionAttempts: UnknownRecord = {
+            mediaEngineConnectionId: connection.mediaEngineConnectionId,
+            context: connection.context
+        };
+
+        if (options.deafened != null) {
+            connectionAttempts.deaf = callFirstAvailable(connection, [
+                "setSelfDeaf",
+                "setDeaf",
+                "setOutputMuted",
+                "setAudioOutputMuted",
+                "setSpeakerMute"
+            ], Boolean(options.deafened));
+
+            if (!options.deafened)
+                connectionAttempts.playback = syncRemotePlayback(connection);
+        }
+
+        if (options.muted != null) {
+            connectionAttempts.mute = callFirstAvailable(connection, [
+                "setSelfMute",
+                "setMute",
+                "setInputMuted",
+                "setMicrophoneMute",
+                "setAudioEnabled"
+            ], Boolean(options.muted), "setAudioEnabled");
+        }
+
+        if (Object.values(connectionAttempts).some(list => Array.isArray(list) && list.some(attempt => attempt.ok)))
+            restored = true;
+        attempts.push(connectionAttempts);
+    }
+
+    log("force_local_media", { options, attempts, after: inspectMediaConnection() });
+    return restored;
+}
+
+function localMediaTarget() {
+    const remote = currentRemoteState();
+    const { fakeDeafen, fakeMute } = settings.store;
+
+    return {
+        muted: fakeMute || fakeDeafen ? false : Boolean(remote.selfMute || remote.selfDeaf),
+        deafened: fakeDeafen ? false : remote.selfDeaf
+    };
+}
+
+function localMediaNeedsRestore() {
+    if (!fakeStateActive()) return false;
+
+    const connections = getMediaConnections();
+    if (!connections.length) {
+        log("local_media_self_check", { ok: false, reason: "RTC media connection unavailable", remote: currentRemoteState() });
+        return true;
+    }
+
+    const states = connections.map(connection => {
+        let selfMute: unknown;
+        let selfDeaf: unknown;
+        try { selfMute = connection.getSelfMute?.(); } catch (err) { selfMute = `error:${String(err)}`; }
+        try { selfDeaf = connection.getSelfDeaf?.(); } catch (err) { selfDeaf = `error:${String(err)}`; }
+        return { mediaEngineConnectionId: connection.mediaEngineConnectionId, selfMute, selfDeaf };
+    });
+    const target = localMediaTarget();
+
+    const needsRestore = states.some(state => state.selfMute !== target.muted || state.selfDeaf !== target.deafened);
+    log("local_media_self_check", {
+        ok: !needsRestore,
+        needsRestore,
+        states,
+        target,
+        fakeMute: settings.store.fakeMute,
+        fakeDeafen: settings.store.fakeDeafen
+    });
+
+    return needsRestore;
+}
+
+function selfCheckLocalMedia(reason = "self-check") {
+    if (!fakeStateActive()) return;
+
+    void syncVisibleState(reason);
+    if (!settings.store.autoRestoreLocalMedia) return;
+
+    if (!localMediaNeedsRestore()) return;
+
+    if (!forceLocalMedia(localMediaTarget())) restoreLocalMediaSoon(`${reason}:fallback`);
+}
+
+function clearRestoreBurst() {
+    for (const timer of restoreBurstTimers) window.clearTimeout(timer);
+    restoreBurstTimers = [];
+}
+
+function forgetRestoreBurstTimer(timer: number) {
+    restoreBurstTimers = restoreBurstTimers.filter(activeTimer => activeTimer !== timer);
+}
+
+function trimRestoreBurstTimers(maxTimers = 64) {
+    if (restoreBurstTimers.length <= maxTimers) return;
+
+    const removeCount = restoreBurstTimers.length - maxTimers;
+    const staleTimers = restoreBurstTimers.splice(0, removeCount);
+    for (const timer of staleTimers) window.clearTimeout(timer);
+}
+
+function scheduleRestoreAttempt(wait: number) {
+    let timer = 0;
+    timer = window.setTimeout(() => {
+        forgetRestoreBurstTimer(timer);
+        if (!fakeStateActive()) return;
+        forceLocalMedia(localMediaTarget());
+    }, wait);
+
+    restoreBurstTimers.push(timer);
+}
+
+function restoreLocalMediaSoon(reason = "restore") {
+    if (!fakeStateActive()) return;
+
+    const delay = Math.max(0, Number(settings.store.restoreDelayMs) || 0);
+    const delays = [0, delay, delay + 250, delay + 700, delay + 1300, delay + 2200, delay + 3500, delay + 5000];
+
+    for (const wait of delays) scheduleRestoreAttempt(wait);
+    trimRestoreBurstTimers();
+
+    log("restore_local_media_burst_scheduled", {
+        reason,
+        delays,
+        queuedTimers: restoreBurstTimers.length,
+        target: localMediaTarget()
+    });
+}
+
+function scheduleApplyConfiguredState(reason: string, delay = 300) {
+    if (applyTimer) clearTimeout(applyTimer);
+    applyTimer = setTimeout(() => {
+        applyTimer = undefined;
+        log("scheduled_state_restore", { reason, remote: currentRemoteState(), media: inspectMediaConnection() });
+        void ensureConfiguredState(reason);
+    }, delay);
+}
+
+async function setFakeMute(enabled: boolean, source = "ui") {
+    const wasActive = fakeSessionActive;
+    cancelPendingFakeWork();
+    updateFakeMuteSetting(enabled);
+    fakeSessionActive = fakeStateActive();
+    if (!wasActive && fakeSessionActive) postFakeIntent = { selfMute: false, selfDeaf: false };
+
+    log("set_fake_mute", { enabled, source, visibleTarget: visibleVoiceTarget(), localTarget: localMediaTarget(), before: inspectMediaConnection() });
+    if (fakeSessionActive) forceLocalMedia(localMediaTarget());
+    await syncVisibleState(`setFakeMute:${source}`);
+    forceLocalMedia(localMediaTarget());
+    restoreLocalMediaSoon(`setFakeMute:${source}`);
+}
+
+async function setFakeDeafen(enabled: boolean, source = "ui") {
+    const wasActive = fakeSessionActive;
+    cancelPendingFakeWork();
+    updateFakeDeafenSetting(enabled);
+    fakeSessionActive = fakeStateActive();
+    if (!wasActive && fakeSessionActive) postFakeIntent = { selfMute: false, selfDeaf: false };
+
+    log("set_fake_deafen", { enabled, source, visibleTarget: visibleVoiceTarget(), localTarget: localMediaTarget(), before: inspectMediaConnection() });
+    if (fakeSessionActive) forceLocalMedia(localMediaTarget());
+    await syncVisibleState(`setFakeDeafen:${source}`);
+    forceLocalMedia(localMediaTarget());
+    restoreLocalMediaSoon(`setFakeDeafen:${source}`);
+}
+
+async function ensureConfiguredState(reason = "ensure", attempt = 0, generation = ++ensureGeneration) {
+    const remote = currentRemoteState();
+    if (!remote.channelId) {
+        log("apply_skipped", { reason: "not in voice", remote });
+        return;
+    }
+
+    if (!fakeStateActive()) {
+        log("apply_skipped", { reason: "local overrides disabled", trigger: reason, remote });
+        return;
+    }
+
+    log("ensure_configured_state", { reason, attempt, remote, visibleTarget: visibleVoiceTarget(), localTarget: localMediaTarget(), media: inspectMediaConnection() });
+    await syncVisibleState(reason);
+    forceLocalMedia(localMediaTarget());
+    restoreLocalMediaSoon(reason);
+
+    if (attempt >= 2 || !fakeStateActive()) return;
+
+    window.setTimeout(() => {
+        if (generation !== ensureGeneration || !fakeStateActive()) return;
+        void ensureConfiguredState(`${reason}:retry`, attempt + 1, generation);
+    }, Math.max(900, Number(settings.store.restoreDelayMs) + 500));
+}
+
+function startRestoreTimer() {
+    stopRestoreTimer();
+    restoreTimer = setInterval(() => selfCheckLocalMedia("periodic self-check"), 2500);
+}
+
+function stopRestoreTimer() {
+    if (restoreTimer) clearInterval(restoreTimer);
+    restoreTimer = undefined;
+    cancelPendingApplyTimer();
+    clearRestoreBurst();
+}
+
+function exposeHelpers() {
+    const g = globalThis as typeof globalThis & {
+        FakeMuteDeafenLabStatus?: () => unknown;
+        FakeMuteDeafenLabSetMute?: (enabled: boolean) => Promise<void>;
+        FakeMuteDeafenLabSetDeafen?: (enabled: boolean) => Promise<void>;
+        FakeMuteDeafenLabRestoreLocal?: () => boolean;
+    };
+
+    g.FakeMuteDeafenLabStatus = inspectMediaConnection;
+    g.FakeMuteDeafenLabSetMute = (enabled: boolean) => setFakeMute(Boolean(enabled), "console");
+    g.FakeMuteDeafenLabSetDeafen = (enabled: boolean) => setFakeDeafen(Boolean(enabled), "console");
+    g.FakeMuteDeafenLabRestoreLocal = () => forceLocalMedia(localMediaTarget());
+}
+
+function removeHelpers() {
+    const g = globalThis as any;
+    delete g.FakeMuteDeafenLabStatus;
+    delete g.FakeMuteDeafenLabSetMute;
+    delete g.FakeMuteDeafenLabSetDeafen;
+    delete g.FakeMuteDeafenLabRestoreLocal;
+}
+
+export default definePlugin({
+    name: "FakeMuteDeafenLab",
+    description: "Show visible mute/deafen states while keeping the covered local RTC media active.",
+    authors: [{ name: "Baann_", id: 652781779760971776n }],
+    settings,
+    commands: [
+        {
+            name: "fakemute",
+            description: "Toggle Fake Mute",
+            inputType: ApplicationCommandInputType.BUILT_IN,
+            execute: () => {
+                void setFakeMute(!settings.store.fakeMute, "command");
+                return { content: `Fake Mute ${settings.store.fakeMute ? "ON" : "OFF"}` };
+            },
+        },
+        {
+            name: "fakedeafen",
+            description: "Toggle Fake Deafen",
+            inputType: ApplicationCommandInputType.BUILT_IN,
+            execute: () => {
+                void setFakeDeafen(!settings.store.fakeDeafen, "command");
+                return { content: `Fake Deafen ${settings.store.fakeDeafen ? "ON" : "OFF"}` };
+            },
+        },
+    ] as any,
+
+    start() {
+        fakeSessionActive = fakeStateActive();
+        if (fakeSessionActive) postFakeIntent = { selfMute: false, selfDeaf: false };
+        installRtcTracker();
+        exposeHelpers();
+        startRestoreTimer();
+        window.setTimeout(() => void ensureConfiguredState("startup"), 1500);
+    },
+
+    stop() {
+        stopRestoreTimer();
+        postFakeIntent = { selfMute: false, selfDeaf: false };
+        fakeSessionActive = false;
+        updateFakeMuteSetting(false);
+        updateFakeDeafenSetting(false);
+        void syncVisibleState("plugin stop").then(() => forceLocalMedia(localMediaTarget()));
+        removeHelpers();
+        uninstallRtcTracker();
+    },
+
+    flux: {
+        AUDIO_SET_SELF_MUTE({ mute }: { mute?: boolean; }) {
+            rememberNativeMuteIntent(mute);
+            if (fakeStateActive()) scheduleApplyConfiguredState("native AUDIO_SET_SELF_MUTE");
+        },
+
+        AUDIO_TOGGLE_SELF_MUTE() {
+            rememberNativeMuteIntent();
+            if (fakeStateActive()) scheduleApplyConfiguredState("native AUDIO_TOGGLE_SELF_MUTE");
+        },
+
+        AUDIO_TOGGLE_SELF_DEAF() {
+            rememberNativeDeafIntent();
+            if (fakeStateActive()) scheduleApplyConfiguredState("native AUDIO_TOGGLE_SELF_DEAF");
+        },
+
+        VOICE_STATE_UPDATES({ voiceStates }: { voiceStates: Array<{ userId?: string; channelId?: string | null; selfMute?: boolean; selfDeaf?: boolean; }>; }) {
+            const currentUserId = UserStore.getCurrentUser?.()?.id;
+            if (!currentUserId) return;
+            const ownState = voiceStates?.find(state => state?.userId === currentUserId);
+            if (!ownState) return;
+
+            confirmPendingVisibleTarget();
+            if (fakeStateActive()) scheduleApplyConfiguredState("own VOICE_STATE_UPDATES");
+        },
+
+        RTC_CONNECTION_STATE({ state }: { state?: string; }) {
+            if (state === "RTC_CONNECTED" || state === "RTC_CONNECTING" || state === "AUTHENTICATING")
+                scheduleApplyConfiguredState(`RTC_CONNECTION_STATE ${state}`);
+        },
+
+        VOICE_CHANNEL_SELECT() {
+            scheduleApplyConfiguredState("VOICE_CHANNEL_SELECT", 1000);
+        }
+    }
+});
 
