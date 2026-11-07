@@ -1,0 +1,28 @@
+это файл гайд как и что делать 
+Шаг 1. Установить инструменты
+Нужны Node.js LTS, Git и pnpm. В терминале (PowerShell или CMD) по одной команде:
+winget install OpenJS.NodeJS.LTS
+winget install Git.Git
+npm install -g pnpm
+После установки закрой и снова открой терминал, чтобы команды подхватились. Проверка:
+node -v
+git --version
+pnpm -v
+Шаг 2. Скачать исходники Vencord
+cd %USERPROFILE%\Documents
+git clone https://github.com/Vendicated/Vencord
+cd Vencord
+pnpm install --frozen-lockfile
+Первый pnpm install занимает несколько минут — это нормально
+Шаг 3. Положить плагин в папку userplugins
+Создать папку и скопировать туда скачанный файл fakeMuteDeafen_index.tsx, переименовав его в index.tsx
+mkdir src\userplugins\fakeMuteDeafen
+copy путь\к\fakeMuteDeafen_index.tsx src\userplugins\fakeMuteDeafen\index.tsx
+Важно: в папке src\userplugins не должно остаться никаких .bak, .txt и пустых папок — Vencord пытается собрать всё, что там лежит, и падает от лишних файлов. Внутри каждого плагина должен быть рабочий index.tsx
+Шаг 4. Собрать и внедрить
+pnpm build
+pnpm inject
+Шаг6. Включить и пользоваться
+Настройки Discord → раздел Vencord (в самом низу) → Plugins → включить FakeMuteDeafenLab.
+Зайти в голосовой канал.
+В чате набрать /fakemute — Discord покажет тебя заглушённым, но микрофон работает. /fakedeafen — то же с «оглох». Повторный ввод команды выключает режим. Там же, в настройках плагина, есть кнопки и статус всех состояний.
